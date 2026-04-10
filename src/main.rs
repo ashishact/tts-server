@@ -41,7 +41,7 @@ impl Config {
             ws_base_url: std::env::var("WS_URL")
                 .unwrap_or_else(|_| "wss://api.ramble.my".to_string()),
             conversation_id: std::env::var("CONVERSATION_ID")
-                .unwrap_or_else(|_| "test".to_string()),
+                .unwrap_or_else(|_| "tts-server".to_string()),
             user_id: std::env::var("USER_ID")
                 .unwrap_or_else(|_| "tts-server".to_string()),
             token: std::env::var("TOKEN").ok(),

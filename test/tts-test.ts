@@ -22,7 +22,7 @@ import crypto from "crypto";
 // ---------------------------------------------------------------------------
 
 const WS_BASE = process.env.WS_URL ?? "wss://api.ramble.my";
-const CONVERSATION_ID = process.env.CONVERSATION_ID ?? "test";
+const CONVERSATION_ID = process.env.CONVERSATION_ID ?? "tts-server";
 const USER_ID = "test-client-" + crypto.randomBytes(3).toString("hex");
 const TEXT_TO_SPEAK =
   process.argv[2] ??
