@@ -1,0 +1,3 @@
+[env]
+# Use the system libopus from Homebrew instead of building from source.
+PKG_CONFIG_PATH = "/opt/homebrew/lib/pkgconfig"

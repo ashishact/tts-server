@@ -1,0 +1,15 @@
+/target/
+
+# Model files — auto-downloaded on first run, too large for git
+/checkpoints/
+/data/
+
+# Environment secrets
+.env
+
+# Test dependencies
+test/node_modules/
+test/dist/
+
+# macOS
+.DS_Store
