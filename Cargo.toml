@@ -38,6 +38,10 @@ dotenvy = "0.15"
 # Base64 for audio payload
 base64 = "0.22"
 
+# Text sanitization (regex patterns for TTS preprocessing)
+regex = "1"
+once_cell = "1"
+
 # Kokoro TTS (Rust/ONNX)
 # Requires espeak-ng installed: brew install espeak-ng
 # Requires model files: checkpoints/kokoro-v1.0.onnx + data/voices-v1.0.bin

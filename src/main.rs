@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::FuturesOrdered, SinkExt, StreamExt};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use kokoros::tts::koko::TTSKoko;
 use serde::{Deserialize, Serialize};
@@ -183,6 +187,43 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Text sanitization (mirrors ramble-web textChunker.sanitizeText)
+// ---------------------------------------------------------------------------
+
+static RE_SPACED_HYPHEN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s*-\s*").unwrap());
+static RE_QUESTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"\?\s*").unwrap());
+static RE_MULTI_NEWLINE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
+static RE_MULTI_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^\S\n]+").unwrap());
+// Markdown: **bold**, *italic*, __bold__, _italic_, `code`, ~~strikethrough~~
+static RE_MARKDOWN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(\*\*|__|\*|_|`|~~|#{1,6}\s?)").unwrap());
+
+fn sanitize_text(text: &str) -> String {
+    let s = text.to_string();
+
+    // Normalize line endings
+    let s = s.replace("\r\n", "\n");
+
+    // Strip markdown formatting characters
+    let s = RE_MARKDOWN.replace_all(&s, "").to_string();
+
+    // Em-dash / en-dash → comma pause
+    let s = s.replace('—', ", ").replace('–', ", ");
+
+    // Spaced hyphen → comma pause (e.g. "word - word")
+    let s = RE_SPACED_HYPHEN.replace_all(&s, ", ").to_string();
+
+    // Add a short ellipsis after question marks so Kokoro doesn't rush past them
+    let s = RE_QUESTION.replace_all(&s, "? ... ").to_string();
+
+    // Collapse extra blank lines and spaces
+    let s = RE_MULTI_NEWLINE.replace_all(&s, "\n\n").to_string();
+    let s = RE_MULTI_SPACE.replace_all(&s, " ").to_string();
+
+    s.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
 // TTS synthesis → WebSocket send
 // ---------------------------------------------------------------------------
 
@@ -196,8 +237,7 @@ async fn synthesize_and_send(
     language: String,
     speed: f32,
 ) -> Result<()> {
-    // Block here until a worker is free — this is the queue.
-    let (mut worker, permit) = pool.acquire().await;
+    let text = sanitize_text(&text);
 
     info!(
         "Synthesizing ({} chars): {:?}",
@@ -205,37 +245,69 @@ async fn synthesize_and_send(
         &text[..text.len().min(80)]
     );
 
-    let chunks = worker.split_text_into_speech_chunks(&text, 30);
+    // Acquire one worker just to split the text, then release it immediately
+    // so it's available for parallel chunk synthesis below.
+    let chunks: Vec<String> = {
+        let (worker, permit) = pool.acquire().await;
+        let chunks = worker.split_text_into_speech_chunks(&text, 30);
+        pool.release(worker, permit).await;
+        chunks
+    };
+
+    // Filter empty chunks up front so we know the true total for isFinal.
+    let chunks: Vec<String> = chunks
+        .into_iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
     let total = chunks.len();
 
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        if chunk.trim().is_empty() {
-            continue;
-        }
-        let is_final = i == total - 1;
+    if total == 0 {
+        return Ok(());
+    }
 
-        // Run blocking ONNX inference on the thread-pool.
-        // We move the worker in and get it back with the result.
-        let chunk_text = chunk.clone();
-        let voice_ref = voice.clone();
-        let lang_ref = language.clone();
+    // Spawn one synthesis task per chunk. Each task acquires its own pool
+    // worker, so chunks are synthesised in parallel (up to TTS_WORKERS at a
+    // time). FuturesOrdered ensures we send them to the client in order even
+    // if a later chunk finishes first — eliminating the gap between chunks.
+    let mut futures: FuturesOrdered<_> = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let pool = Arc::clone(&pool);
+            let voice = voice.clone();
+            let language = language.clone();
+            tokio::spawn(async move {
+                let (worker, permit) = pool.acquire().await;
+                let chunk_text = chunk.clone();
+                let voice_ref = voice.clone();
+                let lang_ref = language.clone();
 
-        let (returned_worker, samples) = tokio::task::spawn_blocking(move || {
-            let result = worker
-                .tts_raw_audio(&chunk_text, &lang_ref, &voice_ref, speed, None, None, None, None)
-                .map_err(|e| e.to_string());
-            (worker, result)
+                let (returned_worker, samples) = tokio::task::spawn_blocking(move || {
+                    let result = worker
+                        .tts_raw_audio(&chunk_text, &lang_ref, &voice_ref, speed, None, None, None, None)
+                        .map_err(|e| e.to_string());
+                    (worker, result)
+                })
+                .await
+                .expect("TTS thread panicked");
+
+                pool.release(returned_worker, permit).await;
+                (i, chunk, samples)
+            })
         })
-        .await
-        .context("TTS thread panicked")?;
+        .collect();
 
-        worker = returned_worker;
+    // Stream results in order and send each chunk as it becomes ready.
+    let mut send_idx = 0usize;
+    while let Some(join_result) = futures.next().await {
+        let (i, chunk, samples) = join_result.context("TTS task panicked")?;
         let samples = samples.map_err(|e| anyhow::anyhow!("TTS synthesis: {e}"))?;
 
         if samples.is_empty() {
             continue;
         }
 
+        let is_final = send_idx == total - 1;
         let duration_ms = (samples.len() as f64 / 24_000.0 * 1000.0) as u64;
         let wav = encode_wav(&samples, 24_000)?;
         let audio_b64 = BASE64.encode(&wav);
@@ -262,12 +334,11 @@ async fn synthesize_and_send(
 
         info!(
             "  chunk {}/{} sent ({} ms, {} bytes WAV)",
-            i + 1, total, duration_ms, wav.len()
+            send_idx + 1, total, duration_ms, wav.len()
         );
-    }
 
-    // Return the worker to the pool — unblocks the next queued request.
-    pool.release(worker, permit).await;
+        send_idx += 1;
+    }
 
     Ok(())
 }
@@ -276,7 +347,13 @@ async fn synthesize_and_send(
 // WebSocket connection loop (reconnecting)
 // ---------------------------------------------------------------------------
 
+/// Dedup cache: message id → time received. Shared across reconnects.
+type SeenMessages = Arc<Mutex<HashMap<String, Instant>>>;
+
+const DEDUP_WINDOW: Duration = Duration::from_secs(10);
+
 async fn run(config: Arc<Config>, pool: Arc<TtsPool>) {
+    let seen: SeenMessages = Arc::new(Mutex::new(HashMap::new()));
     let mut backoff = Duration::from_secs(1);
 
     loop {
@@ -340,6 +417,19 @@ async fn run(config: Arc<Config>, pool: Arc<TtsPool>) {
                                 }
 
                                 "tts_request" => {
+                                    // Dedup: ignore the same message id within DEDUP_WINDOW.
+                                    {
+                                        let mut cache = seen.lock().await;
+                                        let now = Instant::now();
+                                        // Evict stale entries to keep the map bounded.
+                                        cache.retain(|_, t| now.duration_since(*t) < DEDUP_WINDOW);
+                                        if cache.contains_key(&msg.id) {
+                                            warn!("Duplicate tts_request {} — ignoring", msg.id);
+                                            continue;
+                                        }
+                                        cache.insert(msg.id.clone(), now);
+                                    }
+
                                     let text_to_speak = msg
                                         .payload
                                         .get("text")

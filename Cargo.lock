@@ -2165,6 +2165,8 @@ dependencies = [
  "futures-util",
  "hound",
  "kokoros",
+ "once_cell",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
