@@ -22,7 +22,7 @@ log "Checking system packages..."
 
 if command -v apt-get &>/dev/null; then
   PKGS_NEEDED=()
-  for pkg in espeak-ng pkg-config libssl-dev build-essential cmake git curl; do
+  for pkg in espeak-ng libespeak-ng-dev pkg-config libssl-dev build-essential cmake git curl clang libclang-dev; do
     dpkg -s "$pkg" &>/dev/null || PKGS_NEEDED+=("$pkg")
   done
   if [ ${#PKGS_NEEDED[@]} -gt 0 ]; then
@@ -33,9 +33,9 @@ if command -v apt-get &>/dev/null; then
     warn "All system packages already installed."
   fi
 elif command -v yum &>/dev/null; then
-  sudo yum install -y espeak-ng espeak-ng-devel openssl-devel gcc gcc-c++ cmake git curl
+  sudo yum install -y espeak-ng espeak-ng-devel openssl-devel gcc gcc-c++ cmake git curl clang clang-devel
 elif command -v dnf &>/dev/null; then
-  sudo dnf install -y espeak-ng espeak-ng-devel openssl-devel gcc gcc-c++ cmake git curl
+  sudo dnf install -y espeak-ng espeak-ng-devel openssl-devel gcc gcc-c++ cmake git curl clang clang-devel
 else
   die "Unsupported package manager. Install manually: espeak-ng, openssl-dev, cmake, gcc, git."
 fi
