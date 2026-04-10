@@ -359,8 +359,14 @@ async fn run(config: Arc<Config>, pool: Arc<TtsPool>) {
                                     }
 
                                     let (pool, tx) = (Arc::clone(&pool), tx.clone());
-                                    let (v, l, sp) = (
-                                        config.voice.clone(),
+                                    // Use voice from payload if provided, else fall back to config default.
+                                    let v = msg
+                                        .payload
+                                        .get("voice")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&config.voice)
+                                        .to_string();
+                                    let (l, sp) = (
                                         config.language.clone(),
                                         config.speed,
                                     );

@@ -30,6 +30,9 @@ const TEXT_TO_SPEAK =
     "Each sentence is synthesised and sent back as a separate audio chunk. " +
     "Can you hear all three parts arriving one by one?";
 
+// Optional: pass a voice as the second argument, e.g. tsx tts-test.ts "Hello" af_bella
+const VOICE = process.argv[3] ?? null;
+
 const WS_URL = `${WS_BASE}/ws/${CONVERSATION_ID}?type=runtime&userId=${USER_ID}`;
 
 // ---------------------------------------------------------------------------
@@ -116,7 +119,7 @@ async function main() {
     const req = makeMessage(
       "tts_request",
       { type: "agent" },
-      { text: TEXT_TO_SPEAK }
+      { text: TEXT_TO_SPEAK, ...(VOICE ? { voice: VOICE } : {}) }
     );
     ws.send(JSON.stringify(req));
     startTime = Date.now();
