@@ -22,7 +22,7 @@ log "Checking system packages..."
 
 if command -v apt-get &>/dev/null; then
   PKGS_NEEDED=()
-  for pkg in espeak-ng libespeak-ng-dev pkg-config libssl-dev build-essential cmake git curl clang libclang-dev; do
+  for pkg in espeak-ng libespeak-ng-dev libsonic-dev libpcaudio-dev pkg-config libssl-dev build-essential cmake git curl clang libclang-dev; do
     dpkg -s "$pkg" &>/dev/null || PKGS_NEEDED+=("$pkg")
   done
   if [ ${#PKGS_NEEDED[@]} -gt 0 ]; then
