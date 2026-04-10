@@ -115,7 +115,7 @@ async function main() {
     agentReady = true;
     const req = makeMessage(
       "tts_request",
-      { type: "tts-server" },
+      { type: "agent" },
       { text: TEXT_TO_SPEAK }
     );
     ws.send(JSON.stringify(req));
@@ -203,7 +203,7 @@ async function main() {
           `[tts-test] 👥 Presence: ${clientType} ${userId} ${event}`
         );
         // Fire the request as soon as we know an agent has joined.
-        if (clientType === "tts-server" && event === "joined") {
+        if (clientType === "agent" && event === "joined") {
           sendTtsRequest();
         }
         break;

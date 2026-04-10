@@ -66,7 +66,7 @@ impl Config {
 
     fn connection_url(&self) -> String {
         let mut url = format!(
-            "{}/ws/{}?type=tts-server&userId={}",
+            "{}/ws/{}?type=agent&userId={}",
             self.ws_base_url, self.conversation_id, self.user_id
         );
         if let Some(token) = &self.token {
@@ -329,7 +329,7 @@ async fn run(config: Arc<Config>, pool: Arc<TtsPool>) {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("?");
                                     info!(
-                                        "Registered as tts-server  wsId={ws_id}  workers={}",
+                                        "Registered as agent (tts-server)  wsId={ws_id}  workers={}",
                                         pool.workers
                                     );
                                 }
