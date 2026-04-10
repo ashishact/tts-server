@@ -9,7 +9,7 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 use kokoros::tts::koko::TTSKoko;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -29,6 +29,9 @@ struct Config {
     voice: String,
     language: String,
     speed: f32,
+    /// How many requests can be synthesised in parallel.
+    /// Each worker loads one copy of the model into memory (~310 MB each).
+    workers: usize,
 }
 
 impl Config {
@@ -54,6 +57,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1.0),
+            workers: std::env::var("TTS_WORKERS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
         })
     }
 
@@ -66,6 +73,63 @@ impl Config {
             url.push_str(&format!("&token={token}"));
         }
         url
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker pool
+//
+// Each worker is an independent TTSKoko instance (separate ONNX session).
+// Cloning TTSKoko shares its internal mutex, so we need N separate ::new() calls.
+//
+// acquire() blocks until a worker is free, so requests beyond TTS_WORKERS
+// are automatically queued — no messages are dropped.
+// ---------------------------------------------------------------------------
+
+struct TtsPool {
+    instances: Arc<Mutex<Vec<TTSKoko>>>,
+    semaphore: Arc<Semaphore>,
+    pub workers: usize,
+}
+
+impl TtsPool {
+    async fn new(config: &Config) -> Self {
+        let mut instances = Vec::with_capacity(config.workers);
+        for i in 0..config.workers {
+            info!(
+                "Loading TTS worker {}/{} …",
+                i + 1,
+                config.workers
+            );
+            instances.push(TTSKoko::new(&config.model_path, &config.voices_path).await);
+        }
+        TtsPool {
+            instances: Arc::new(Mutex::new(instances)),
+            semaphore: Arc::new(Semaphore::new(config.workers)),
+            workers: config.workers,
+        }
+    }
+
+    /// Check out one worker. Waits if all workers are busy.
+    async fn acquire(&self) -> (TTSKoko, OwnedSemaphorePermit) {
+        // Acquire permit first — this is where queuing happens.
+        let permit = Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
+        let instance = self
+            .instances
+            .lock()
+            .await
+            .pop()
+            .expect("semaphore and pool out of sync");
+        (instance, permit)
+    }
+
+    /// Return a worker to the pool (permit is dropped → next waiter unblocks).
+    async fn release(&self, instance: TTSKoko, permit: OwnedSemaphorePermit) {
+        self.instances.lock().await.push(instance);
+        drop(permit);
     }
 }
 
@@ -123,24 +187,25 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 async fn synthesize_and_send(
-    tts: Arc<TTSKoko>,
+    pool: Arc<TtsPool>,
     tx: mpsc::Sender<String>,
     text: String,
     reply_to_id: String,
-    // Route back to the specific sender wsId, else broadcast to all runtimes.
     sender_ws_id: Option<String>,
     voice: String,
     language: String,
     speed: f32,
 ) -> Result<()> {
+    // Block here until a worker is free — this is the queue.
+    let (mut worker, permit) = pool.acquire().await;
+
     info!(
         "Synthesizing ({} chars): {:?}",
         text.len(),
         &text[..text.len().min(80)]
     );
 
-    // Split into sentence-level speech chunks (≤30 words each).
-    let chunks = tts.split_text_into_speech_chunks(&text, 30);
+    let chunks = worker.split_text_into_speech_chunks(&text, 30);
     let total = chunks.len();
 
     for (i, chunk) in chunks.into_iter().enumerate() {
@@ -150,28 +215,22 @@ async fn synthesize_and_send(
         let is_final = i == total - 1;
 
         // Run blocking ONNX inference on the thread-pool.
-        let tts_ref = Arc::clone(&tts);
+        // We move the worker in and get it back with the result.
         let chunk_text = chunk.clone();
         let voice_ref = voice.clone();
         let lang_ref = language.clone();
 
-        let samples = tokio::task::spawn_blocking(move || {
-            tts_ref
-                .tts_raw_audio(
-                    &chunk_text,
-                    &lang_ref,
-                    &voice_ref,
-                    speed,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .map_err(|e| e.to_string())
+        let (returned_worker, samples) = tokio::task::spawn_blocking(move || {
+            let result = worker
+                .tts_raw_audio(&chunk_text, &lang_ref, &voice_ref, speed, None, None, None, None)
+                .map_err(|e| e.to_string());
+            (worker, result)
         })
         .await
-        .context("TTS thread panicked")?
-        .map_err(|e| anyhow::anyhow!("TTS synthesis: {e}"))?;
+        .context("TTS thread panicked")?;
+
+        worker = returned_worker;
+        let samples = samples.map_err(|e| anyhow::anyhow!("TTS synthesis: {e}"))?;
 
         if samples.is_empty() {
             continue;
@@ -181,7 +240,6 @@ async fn synthesize_and_send(
         let wav = encode_wav(&samples, 24_000)?;
         let audio_b64 = BASE64.encode(&wav);
 
-        // Routing: specific wsId > all runtime clients.
         let to = match &sender_ws_id {
             Some(id) => serde_json::json!({ "id": id }),
             None => serde_json::json!({ "type": "runtime" }),
@@ -204,12 +262,12 @@ async fn synthesize_and_send(
 
         info!(
             "  chunk {}/{} sent ({} ms, {} bytes WAV)",
-            i + 1,
-            total,
-            duration_ms,
-            wav.len()
+            i + 1, total, duration_ms, wav.len()
         );
     }
+
+    // Return the worker to the pool — unblocks the next queued request.
+    pool.release(worker, permit).await;
 
     Ok(())
 }
@@ -218,7 +276,7 @@ async fn synthesize_and_send(
 // WebSocket connection loop (reconnecting)
 // ---------------------------------------------------------------------------
 
-async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
+async fn run(config: Arc<Config>, pool: Arc<TtsPool>) {
     let mut backoff = Duration::from_secs(1);
 
     loop {
@@ -234,11 +292,9 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
             }
             Ok((ws, _)) => {
                 info!("WebSocket connected");
-                backoff = Duration::from_secs(1); // reset on clean connect
+                backoff = Duration::from_secs(1);
 
                 let (mut sink, mut stream) = ws.split();
-
-                // Outbound channel — decouples synthesis tasks from the sink.
                 let (tx, mut rx) = mpsc::channel::<String>(64);
 
                 tokio::spawn(async move {
@@ -272,18 +328,17 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                                         .get("wsId")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("?");
-                                    info!("Registered as tts-server  wsId={ws_id}");
+                                    info!(
+                                        "Registered as tts-server  wsId={ws_id}  workers={}",
+                                        pool.workers
+                                    );
                                 }
 
                                 "ping" => {
-                                    let pong =
-                                        WsMessage::new("pong", None, serde_json::json!({}));
-                                    let _ = tx
-                                        .send(serde_json::to_string(&pong).unwrap())
-                                        .await;
+                                    let pong = WsMessage::new("pong", None, serde_json::json!({}));
+                                    let _ = tx.send(serde_json::to_string(&pong).unwrap()).await;
                                 }
 
-                                // Explicit TTS request routed to this agent.
                                 "tts_request" => {
                                     let text_to_speak = msg
                                         .payload
@@ -303,7 +358,7 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                                         continue;
                                     }
 
-                                    let (tts, tx) = (Arc::clone(&tts), tx.clone());
+                                    let (pool, tx) = (Arc::clone(&pool), tx.clone());
                                     let (v, l, sp) = (
                                         config.voice.clone(),
                                         config.language.clone(),
@@ -311,7 +366,7 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                                     );
                                     tokio::spawn(async move {
                                         if let Err(e) = synthesize_and_send(
-                                            tts, tx, text_to_speak, reply_to, sender_id, v, l, sp,
+                                            pool, tx, text_to_speak, reply_to, sender_id, v, l, sp,
                                         )
                                         .await
                                         {
@@ -320,7 +375,6 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                                     });
                                 }
 
-                                // Assistant response broadcast — TTS the reply text.
                                 "assistant_response" => {
                                     let text_to_speak = msg
                                         .payload
@@ -340,7 +394,7 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                                         continue;
                                     }
 
-                                    let (tts, tx) = (Arc::clone(&tts), tx.clone());
+                                    let (pool, tx) = (Arc::clone(&pool), tx.clone());
                                     let (v, l, sp) = (
                                         config.voice.clone(),
                                         config.language.clone(),
@@ -348,7 +402,7 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                                     );
                                     tokio::spawn(async move {
                                         if let Err(e) = synthesize_and_send(
-                                            tts, tx, text_to_speak, reply_to, None, v, l, sp,
+                                            pool, tx, text_to_speak, reply_to, None, v, l, sp,
                                         )
                                         .await
                                         {
@@ -357,7 +411,6 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                                     });
                                 }
 
-                                // Ignore presence, chunk_result, and anything else.
                                 _ => {}
                             }
                         }
@@ -367,9 +420,7 @@ async fn run(config: Arc<Config>, tts: Arc<TTSKoko>) {
                             break;
                         }
 
-                        Ok(Message::Ping(_)) => {
-                            // tokio-tungstenite sends Pong automatically.
-                        }
+                        Ok(Message::Ping(_)) => {}
 
                         Err(e) => {
                             error!("WebSocket read error: {e}");
@@ -403,14 +454,17 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config::from_env().context("Config error")?);
 
-    info!("Loading Kokoro model from {}", config.model_path);
-    let tts = Arc::new(TTSKoko::new(&config.model_path, &config.voices_path).await);
     info!(
-        "TTS engine ready  voice={} lang={}",
-        config.voice, config.language
+        "Initialising {} TTS worker(s) from {}",
+        config.workers, config.model_path
+    );
+    let pool = Arc::new(TtsPool::new(&config).await);
+    info!(
+        "Pool ready  workers={}  voice={}  lang={}",
+        pool.workers, config.voice, config.language
     );
 
-    run(config, tts).await;
+    run(config, pool).await;
 
     Ok(())
 }
